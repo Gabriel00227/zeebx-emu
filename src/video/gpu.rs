@@ -703,6 +703,16 @@ struct Medida {
     quadros: u32,
     bytes_enviados: u64,
     lotes: u64,
+    // Onde o tempo de cada lote vai, em ns, na janela. `Cell` porque a leitura de pixels é `&self`.
+    ns_estado: std::cell::Cell<u64>,
+    ns_vbo: std::cell::Cell<u64>,
+    ns_uniformes: std::cell::Cell<u64>,
+    ns_desenho: std::cell::Cell<u64>,
+    ns_devolve: std::cell::Cell<u64>,
+    ns_envio: std::cell::Cell<u64>,
+    envios: std::cell::Cell<u64>,
+    ns_leitura: std::cell::Cell<u64>,
+    leituras: std::cell::Cell<u64>,
     inicio: Option<std::time::Instant>,
     ultimo: Option<std::time::Instant>,
     pior_quadro: std::time::Duration,
@@ -710,7 +720,68 @@ struct Medida {
 
 /// 300 quadros são 10 s no ritmo de 30 do console: espaçado o bastante para não encher o anel do
 /// log, curto o bastante para separar a primeira volta da segunda.
-const QUADROS_POR_RELATORIO: u32 = 300;
+const QUADROS_POR_RELATORIO: u32 = 60;
+
+/// Soma em `c` o tempo decorrido desde `desde`, em ns.
+fn soma_ns(c: &std::cell::Cell<u64>, desde: std::time::Instant) {
+    c.set(c.get().saturating_add(desde.elapsed().as_nanos() as u64));
+}
+
+/// Soma em `c` o tempo entre dois instantes, em ns.
+fn soma_entre(c: &std::cell::Cell<u64>, de: std::time::Instant, ate: std::time::Instant) {
+    c.set(
+        c.get()
+            .saturating_add(ate.duration_since(de).as_nanos() as u64),
+    );
+}
+
+/// Experimentos de desempenho, ligados por `ZEEBX_EXP=a,b,c` ou pelo arquivo `zeebx_exp.txt` (lido uma vez). Sem a variável o
+/// comportamento é exatamente o de sempre.
+///
+/// - `ctx_quadro`: no caminho do libretro, `devolve_o_contexto` deixa de rodar a cada lote (religa
+///   o framebuffer 0, desliga uns dez estados, e o lote seguinte religa e reenvia tudo) e roda
+///   uma vez por quadro, em `devolve_ao_frontend`.
+/// - `vbo_orfao`: cada lote escreve os vértices com `glBufferData` do tamanho exato (o buffer é
+///   "órfão" a cada lote), em vez de `glBufferSubData` no anel de 3,4 MB.
+/// - `anel_pequeno`: o anel de vértices passa de 65536 para 2048 vértices.
+struct Experimentos {
+    ctx_quadro: bool,
+    vbo_orfao: bool,
+    anel_pequeno: bool,
+    rotulo: String,
+}
+
+fn exp() -> &'static Experimentos {
+    static EXP: std::sync::OnceLock<Experimentos> = std::sync::OnceLock::new();
+    EXP.get_or_init(|| {
+        // Primeiro a variável de ambiente (testes pelo script); sem ela, a primeira linha de
+        // `~/.config/retroarch/zeebx_exp.txt`, que vale também quando o EmulationStation abre o jogo.
+        let texto = std::env::var("ZEEBX_EXP")
+            .ok()
+            .or_else(|| {
+                let casa = std::env::var("HOME").ok()?;
+                std::fs::read_to_string(format!("{casa}/.config/retroarch/zeebx_exp.txt")).ok()
+            })
+            .unwrap_or_default();
+        let texto = texto.lines().next().unwrap_or("").trim().to_string();
+        let tem = |nome: &str| texto.split(',').any(|n| n.trim() == nome);
+        Experimentos {
+            ctx_quadro: tem("ctx_quadro"),
+            vbo_orfao: tem("vbo_orfao"),
+            anel_pequeno: tem("anel_pequeno"),
+            rotulo: texto.clone(),
+        }
+    })
+}
+
+/// Capacidade do anel de vértices, em vértices.
+fn vertices_no_anel() -> usize {
+    if exp().anel_pequeno {
+        2048
+    } else {
+        VERTICES_NO_ANEL
+    }
+}
 
 struct Destino {
     fbo: glow::Framebuffer,
@@ -1497,6 +1568,25 @@ impl GpuState {
             m.bytes_enviados as f64 / 1_048_576.0,
             m.lotes,
         );
+        let q = f64::from(m.quadros.max(1));
+        let ms = |c: &std::cell::Cell<u64>| c.get() as f64 / 1_000_000.0 / q;
+        crate::registro!(
+            crate::registro::Nivel::Informacao,
+            "gl",
+            "tempo: por quadro, {:.1} ms de estado, {:.1} ms de vértices, {:.1} ms de uniformes e binds, \
+{:.1} ms de desenho, {:.1} ms devolvendo o contexto, {:.1} ms em {} envios de textura, \
+{:.1} ms em {} leituras de pixels (exp={})",
+            ms(&m.ns_estado),
+            ms(&m.ns_vbo),
+            ms(&m.ns_uniformes),
+            ms(&m.ns_desenho),
+            ms(&m.ns_devolve),
+            ms(&m.ns_envio),
+            m.envios.get(),
+            ms(&m.ns_leitura),
+            m.leituras.get(),
+            exp().rotulo,
+        );
         self.medida = Medida {
             inicio: Some(agora),
             ultimo: Some(agora),
@@ -1721,9 +1811,11 @@ impl GpuState {
             self.vertices.clear();
             return;
         }
+        let t_estado = std::time::Instant::now();
         self.protege_a_frente();
         self.destino();
         self.aplica();
+        soma_ns(&self.medida.ns_estado, t_estado);
         let textura_da_ponte = textura.is_some();
         let textura = textura.or_else(|| {
             self.fill
@@ -1737,6 +1829,7 @@ impl GpuState {
             _ => None,
         };
         let gl = &self.gl;
+        let t_u0 = std::time::Instant::now();
         unsafe {
             // Ligados **uma vez**, e nao a cada desenho: ver [`Placa::ligados`].
             if self.placa.precisa_ligar() {
@@ -1766,6 +1859,7 @@ impl GpuState {
                 }
                 self.vao_pronto = true;
             }
+            let t_vbo = std::time::Instant::now();
             let bytes = bytes_de_f32(&self.vertices);
             // Na Vita cada lote fica num trecho próprio: a placa lê o ponteiro no fim
             // da cena. Nas outras, o anel pede outro bloco ao encher, e o antigo só se
@@ -1781,7 +1875,7 @@ impl GpuState {
             let primeiro = {
                 let (capacidade, mut livre) = self.anel;
                 if livre + quantos > capacidade {
-                    let capacidade = VERTICES_NO_ANEL.max(quantos);
+                    let capacidade = vertices_no_anel().max(quantos);
                     gl.buffer_data_size(
                         glow::ARRAY_BUFFER,
                         (capacidade * FLOATS_POR_VERTICE * 4) as i32,
@@ -1790,10 +1884,18 @@ impl GpuState {
                     self.anel.0 = capacidade;
                     livre = 0;
                 }
-                gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, livre as i32 * passo, bytes);
-                self.anel.1 = livre + quantos;
-                livre
+                if exp().vbo_orfao {
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+                    self.anel.1 = 0;
+                    0
+                } else {
+                    gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, livre as i32 * passo, bytes);
+                    self.anel.1 = livre + quantos;
+                    livre
+                }
             };
+            let t_vbo_fim = std::time::Instant::now();
+            soma_entre(&self.medida.ns_vbo, t_vbo, t_vbo_fim);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, textura);
             uniforme_i32(gl, &self.uniformes, self.programa, "amostra", 0);
@@ -1866,7 +1968,12 @@ impl GpuState {
                 "cor_neblina",
                 neblina.cor,
             );
+            let t_d0 = std::time::Instant::now();
             gl.draw_arrays(modo, primeiro as i32, quantos as i32);
+            let t_d1 = std::time::Instant::now();
+            soma_entre(&self.medida.ns_desenho, t_d0, t_d1);
+            soma_entre(&self.medida.ns_uniformes, t_u0, t_vbo);
+            soma_entre(&self.medida.ns_uniformes, t_vbo_fim, t_d0);
             // **Nao desligue aqui.** Desligar no fim de cada desenho era o custo que este cache
             // veio tirar: um programa a menos por lote e uma revalidacao a menos em cada um.
         }
@@ -1876,7 +1983,11 @@ impl GpuState {
         // cada lote já tinha mostrado no RetroArch. Correr o personagem é mais sprites.
         // O `retoma_o_contexto` depois da troca esquece o espelho.
         #[cfg(not(target_os = "vita"))]
-        self.devolve_o_contexto();
+        {
+            let t_dev = std::time::Instant::now();
+            self.devolve_o_contexto();
+            soma_ns(&self.medida.ns_devolve, t_dev);
+        }
         self.sujo = true;
     }
 
@@ -2037,6 +2148,16 @@ impl GpuState {
         if !self.placa.de_outro() {
             return;
         }
+        // Experimento `ctx_quadro`: com o FBO do frontend, o contexto só é devolvido uma vez por
+        // quadro, em `devolve_ao_frontend`. O espelho continua exato, porque nada foi mudado.
+        if exp().ctx_quadro && self.fbo_externo.is_some() {
+            return;
+        }
+        self.devolve_o_contexto_ja();
+    }
+
+    /// O corpo de [`GpuState::devolve_o_contexto`], sem as guardas.
+    fn devolve_o_contexto_ja(&self) {
         let gl = &self.gl;
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -3030,6 +3151,9 @@ impl Rasterizador for GpuState {
         if self.fbo_externo.is_none() || self.placa.morreu() {
             return;
         }
+        if exp().ctx_quadro {
+            self.devolve_o_contexto_ja();
+        }
         let gl = &self.gl;
         unsafe {
             gl.bind_vertex_array(None);
@@ -3324,6 +3448,7 @@ impl Rasterizador for GpuState {
         pixels: Vec<[u8; 4]>,
     ) {
         self.descarrega();
+        let t_envio = std::time::Instant::now();
         let bytes: Vec<u8> = pixels.iter().flatten().copied().collect();
         self.medida.bytes_enviados += bytes.len() as u64;
         let gl = &self.gl;
@@ -3423,6 +3548,8 @@ impl Rasterizador for GpuState {
         if precisa_imagem && let Some(t) = self.texturas.get(&name) {
             self.parametros(t);
         }
+        soma_ns(&self.medida.ns_envio, t_envio);
+        self.medida.envios.set(self.medida.envios.get() + 1);
         self.estado.upload_level(name, level, width, height, pixels);
     }
 
@@ -3436,6 +3563,7 @@ impl Rasterizador for GpuState {
         pixels: &[[u8; 4]],
     ) -> Result<(), Option<(u32, u32)>> {
         self.descarrega();
+        let t_envio = std::time::Instant::now();
         let resultado = self.estado.sub_image(name, x, y, width, height, pixels);
         if resultado.is_ok() {
             if let Some(t) = self.texturas.get(&name) {
@@ -3474,6 +3602,8 @@ impl Rasterizador for GpuState {
                 }
             }
         }
+        soma_ns(&self.medida.ns_envio, t_envio);
+        self.medida.envios.set(self.medida.envios.get() + 1);
         resultado
     }
 
@@ -3668,6 +3798,7 @@ impl Rasterizador for GpuState {
         if width == 0 || height == 0 {
             return Vec::new();
         }
+        let t_leitura = std::time::Instant::now();
         self.liga_para_leitura(false);
         let altura_da_superficie = self.surface().1 as i32;
         let de_baixo = altura_da_superficie - y - height as i32;
@@ -3684,6 +3815,8 @@ impl Rasterizador for GpuState {
             );
         }
         self.devolve_o_contexto();
+        soma_ns(&self.medida.ns_leitura, t_leitura);
+        self.medida.leituras.set(self.medida.leituras.get() + 1);
         let mut saida = Vec::with_capacity(width * height);
         for linha in bytes.chunks_exact(width * 4).rev() {
             saida.extend(linha.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]));
